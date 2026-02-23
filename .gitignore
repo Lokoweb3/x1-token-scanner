@@ -1,0 +1,14 @@
+*.db
+*.sqlite
+*.log
+__pycache__/
+*.pyc
+bot.log
+nohup.out
+.env
+*.bak
+*.bak2
+*.bak3
+debug_*.py
+test_*.py
+decode_*.py
