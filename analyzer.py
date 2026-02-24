@@ -88,6 +88,11 @@ class SecurityReport:
     
     age_str: str
     
+    deployer: Optional[str]
+    deployer_tokens_created: int
+    deployer_balance: float
+    deployer_creation_date: str
+    
     risk_level: RiskLevel
     risk_score: int
     warnings: List[str]
@@ -193,13 +198,16 @@ class SecurityReport:
 ├ MCap: {mcap_str}
 ├ Liquidity: {liq_str}
 ├ 24h Vol: {vol_str}
-└ Supply: {supply_str}
+└ Supply: {supply_str} | Age: {self.age_str}
 
 🔐 *Security*
 ├ Mint: {mint_icon}
 ├ Freeze: {freeze_icon}
 ├ LP Safety: {lp_safety_str}
 └ Risk: {self.risk_score}/100 {risk_emoji} {risk_label}
+
+👤 *Deployer*
+{self._format_deployer()}
 
 🔥 *LP Burn Status*
 {lp_str}
@@ -231,6 +239,35 @@ class SecurityReport:
         msg += f"\n_Risk: 🟢 0-24 LOW | 🟡 25-49 MEDIUM | 🔴 50-74 HIGH | ☠️ 75+ CRITICAL_"
         
         return msg
+
+    def _format_deployer(self) -> str:
+        """Format deployer info"""
+        if not self.deployer:
+            return "└ Unknown"
+        
+        addr = self.deployer
+        addr_short = f"`{addr[:6]}...{addr[-6:]}`"
+        
+        lines = []
+        lines.append(f"├ Address: {addr_short}")
+        
+        if self.deployer_creation_date:
+            lines.append(f"├ Created: {self.deployer_creation_date}")
+        
+        if self.deployer_tokens_created > 0:
+            lines.append(f"├ Tokens deployed: {self.deployer_tokens_created}")
+        
+        if self.deployer_balance > 0:
+            bal_str = self._format_number(self.deployer_balance)
+            lines.append(f"├ Still holds: {bal_str}")
+        else:
+            lines.append(f"├ Holdings: None (sold or transferred)")
+        
+        # Change last connector
+        if lines:
+            lines[-1] = lines[-1].replace("├", "└", 1)
+        
+        return "\n".join(lines)
 
     def _format_usd(self, amount: float) -> str:
         """Format USD price with appropriate decimals"""
@@ -428,10 +465,11 @@ class TokenAnalyzer:
         age_task = self.rpc.get_token_age(mint_address)
         lp_task = self.rpc.get_lp_info(mint_address, token_info.decimals)
         holder_count_task = self.rpc.get_accurate_holder_count(mint_address)
+        deployer_task = self.rpc.get_deployer_info(mint_address)
         
         # Wait for all parallel tasks
-        holder_data, age_str, lp_info, accurate_count = await asyncio.gather(
-            holder_task, age_task, lp_task, holder_count_task
+        holder_data, age_str, lp_info, accurate_count, deployer_info = await asyncio.gather(
+            holder_task, age_task, lp_task, holder_count_task, deployer_task
         )
         
         # Get price change (after we have lp_info for current price)
@@ -586,6 +624,10 @@ class TokenAnalyzer:
             volume_24h_usd=volume_24h_usd,
             mcap_usd=mcap_usd,
             age_str=age_str,
+            deployer=deployer_info.get("deployer") if deployer_info else None,
+            deployer_tokens_created=deployer_info.get("tokens_created", 0) if deployer_info else 0,
+            deployer_balance=deployer_info.get("deployer_balance", 0) if deployer_info else 0,
+            deployer_creation_date=deployer_info.get("creation_date", "") if deployer_info else "",
             risk_level=risk_level,
             risk_score=min(100, risk_score),
             warnings=warnings,

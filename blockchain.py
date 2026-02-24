@@ -227,6 +227,138 @@ class X1RPC:
         except Exception as e:
             print(f"Error getting token age: {e}")
             return None
+
+    async def get_deployer_info(self, mint_address: str) -> Optional[Dict]:
+        """Get token deployer wallet and their history"""
+        from datetime import datetime
+        
+        try:
+            # Step 1: Find the oldest (creation) transaction
+            all_sigs = []
+            before = None
+            for page in range(25):
+                params = [mint_address, {"limit": 1000}]
+                if before:
+                    params[1]["before"] = before
+                result = await self._rpc_request("getSignaturesForAddress", params)
+                if not result:
+                    break
+                all_sigs.extend(result)
+                before = result[-1].get("signature")
+                if len(result) < 1000:
+                    break
+                await asyncio.sleep(0.05)
+
+            if not all_sigs:
+                return None
+
+            # Get the oldest transaction (token creation)
+            oldest_sig = all_sigs[-1].get("signature")
+            creation_time = all_sigs[-1].get("blockTime")
+            
+            if not oldest_sig:
+                return None
+
+            tx = await self._rpc_request(
+                "getTransaction",
+                [oldest_sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
+            )
+            
+            if not tx:
+                return None
+
+            # Step 2: Extract the deployer (fee payer / first signer)
+            message = tx.get("transaction", {}).get("message", {})
+            account_keys = message.get("accountKeys", [])
+            
+            deployer = None
+            for key in account_keys:
+                if isinstance(key, dict):
+                    if key.get("signer", False):
+                        deployer = key.get("pubkey", "")
+                        break
+                elif isinstance(key, str):
+                    deployer = key
+                    break
+
+            if not deployer:
+                return None
+
+            # Step 3: Check how many tokens this deployer has created
+            # Search for initializeMint transactions by this wallet
+            deployer_sigs = await self._rpc_request(
+                "getSignaturesForAddress",
+                [deployer, {"limit": 1000}]
+            )
+
+            tokens_created = 0
+            token_mints = []
+            
+            if deployer_sigs:
+                # Sample up to 50 transactions to find token creations
+                for sig_info in deployer_sigs[:50]:
+                    sig = sig_info.get("signature")
+                    if not sig:
+                        continue
+                    try:
+                        dtx = await self._rpc_request(
+                            "getTransaction",
+                            [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
+                        )
+                        if not dtx:
+                            continue
+
+                        d_message = dtx.get("transaction", {}).get("message", {})
+                        d_instructions = d_message.get("instructions", [])
+                        inner = dtx.get("meta", {}).get("innerInstructions", [])
+                        all_ix = list(d_instructions)
+                        for ig in inner:
+                            all_ix.extend(ig.get("instructions", []))
+
+                        for ix in all_ix:
+                            parsed = ix.get("parsed", {})
+                            if not isinstance(parsed, dict):
+                                continue
+                            ix_type = parsed.get("type", "")
+                            if ix_type in ["initializeMint", "initializeMint2"]:
+                                ix_mint = parsed.get("info", {}).get("mint", "")
+                                if ix_mint and ix_mint not in token_mints:
+                                    tokens_created += 1
+                                    token_mints.append(ix_mint)
+                    except:
+                        continue
+
+            # Step 4: Check if deployer still holds this token
+            deployer_balance = 0
+            try:
+                balance_result = await self._rpc_request(
+                    "getTokenAccountsByOwner",
+                    [deployer, {"mint": mint_address}, {"encoding": "jsonParsed"}]
+                )
+                if balance_result and balance_result.get("value"):
+                    for acc in balance_result["value"]:
+                        info = acc.get("account", {}).get("data", {}).get("parsed", {}).get("info", {})
+                        amt = float(info.get("tokenAmount", {}).get("uiAmount", 0) or 0)
+                        deployer_balance += amt
+            except:
+                pass
+
+            created_str = ""
+            if creation_time:
+                created_str = datetime.fromtimestamp(creation_time).strftime("%Y-%m-%d")
+
+            return {
+                "deployer": deployer,
+                "tokens_created": tokens_created,
+                "token_mints": token_mints,
+                "deployer_balance": deployer_balance,
+                "creation_date": created_str,
+                "creation_tx": oldest_sig,
+            }
+
+        except Exception as e:
+            print(f"Error getting deployer info: {e}")
+            return None
     
     async def get_token_largest_accounts(self, mint_address: str, limit: int = 20) -> List[Dict]:
         """Get largest token accounts"""
