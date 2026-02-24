@@ -283,7 +283,9 @@ class X1RPC:
                         if mint == token_mint and amount > 0:
                             token_balance = amount
                         elif mint == WXNT_MINT and amount > 0:
-                            wxnt_balance = amount
+                            # Pick the largest WXNT balance (main pool)
+                            if wxnt_balance is None or amount > wxnt_balance:
+                                wxnt_balance = amount
                 
                 if token_balance and wxnt_balance and token_balance > 0:
                     price = wxnt_balance / token_balance
@@ -1103,9 +1105,8 @@ class X1RPC:
             now = int(time.time())
             target_time = now - 86400  # 24 hours ago
             
-            # Paginate through transactions to find ones from 24h ago
             before = None
-            max_pages = 10  # Limit pagination
+            max_pages = 10
             
             for page in range(max_pages):
                 params = [token_mint, {"limit": 1000}]
@@ -1120,44 +1121,57 @@ class X1RPC:
                 oldest_time = sigs[-1].get("blockTime", 0)
                 before = sigs[-1].get("signature")
                 
-                # Check if we've gone past 24h ago
                 if oldest_time and oldest_time < target_time:
-                    # Find transaction closest to 24h ago
+                    # Find transactions closest to 24h ago (2 hour window)
+                    candidates = []
                     for sig_info in sigs:
                         block_time = sig_info.get("blockTime", 0)
+                        if block_time and abs(block_time - target_time) < 7200:  # 2 hour window
+                            candidates.append(sig_info)
+                    
+                    # Sort by closest to target time
+                    candidates.sort(key=lambda s: abs(s.get("blockTime", 0) - target_time))
+                    
+                    # Try up to 5 candidates to find a valid price
+                    for sig_info in candidates[:5]:
+                        sig = sig_info.get("signature")
+                        if not sig:
+                            continue
                         
-                        if block_time and abs(block_time - target_time) < 21600:
-                            sig = sig_info.get("signature")
-                            if not sig:
-                                continue
+                        tx = await self._rpc_request(
+                            "getTransaction",
+                            [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
+                        )
+                        
+                        if not tx:
+                            continue
+                        
+                        meta = tx.get("meta", {})
+                        post_balances = meta.get("postTokenBalances", [])
+                        
+                        token_amount = None
+                        wxnt_amount = None
+                        best_wxnt = 0
+                        
+                        for bal in post_balances:
+                            mint = bal.get("mint", "")
+                            owner = bal.get("owner", "")
                             
-                            tx = await self._rpc_request(
-                                "getTransaction",
-                                [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
-                            )
+                            if owner == AMM_AUTHORITY:
+                                amount = float(bal.get("uiTokenAmount", {}).get("uiAmount", 0) or 0)
+                                if mint == token_mint and amount > 0:
+                                    token_amount = amount
+                                elif mint == WXNT_MINT and amount > best_wxnt:
+                                    best_wxnt = amount
+                                    wxnt_amount = amount
+                        
+                        if token_amount and wxnt_amount and token_amount > 0:
+                            old_price = wxnt_amount / token_amount
                             
-                            if not tx:
-                                continue
-                            
-                            meta = tx.get("meta", {})
-                            post_balances = meta.get("postTokenBalances", [])
-                            
-                            token_amount = None
-                            wxnt_amount = None
-                            
-                            for bal in post_balances:
-                                mint = bal.get("mint", "")
-                                owner = bal.get("owner", "")
-                                
-                                if owner == AMM_AUTHORITY:
-                                    amount = float(bal.get("uiTokenAmount", {}).get("uiAmount", 0) or 0)
-                                    if mint == token_mint and amount > 0:
-                                        token_amount = amount
-                                    elif mint == WXNT_MINT and amount > 0:
-                                        wxnt_amount = amount
-                            
-                            if token_amount and wxnt_amount and token_amount > 0:
-                                old_price = wxnt_amount / token_amount
+                            # Sanity check: old price should be within 100x of current
+                            # (skip outliers from pool creation/removal)
+                            ratio = current_price / old_price if old_price > 0 else 0
+                            if 0.01 < ratio < 100:
                                 change = ((current_price - old_price) / old_price) * 100
                                 return change
                     break
