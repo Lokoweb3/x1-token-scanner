@@ -1378,7 +1378,10 @@ class X1RPC:
                         
                         token_amount = None
                         wxnt_amount = None
-                        best_wxnt = 0
+                        
+                        # Collect all AMM authority balances
+                        token_balances = []
+                        wxnt_balances = []
                         
                         for bal in post_balances:
                             mint = bal.get("mint", "")
@@ -1387,10 +1390,15 @@ class X1RPC:
                             if owner == AMM_AUTHORITY:
                                 amount = float(bal.get("uiTokenAmount", {}).get("uiAmount", 0) or 0)
                                 if mint == token_mint and amount > 0:
-                                    token_amount = amount
-                                elif mint == WXNT_MINT and amount > best_wxnt:
-                                    best_wxnt = amount
-                                    wxnt_amount = amount
+                                    token_balances.append(amount)
+                                elif mint == WXNT_MINT and amount > 0:
+                                    wxnt_balances.append(amount)
+                        
+                        # Use largest token balance and smallest WXNT balance
+                        # The direct token/WXNT pool has the most tokens and least WXNT
+                        if token_balances and wxnt_balances:
+                            token_amount = max(token_balances)
+                            wxnt_amount = min(wxnt_balances)
                         
                         if token_amount and wxnt_amount and token_amount > 0:
                             old_price = wxnt_amount / token_amount
