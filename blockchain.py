@@ -597,18 +597,13 @@ class X1RPC:
                     # We'll check for burns first and calculate original supply
 
                     # ── LP Burn Detection ──
-                    # Method: On-chain supply difference (matches Loko_AI)
-                    # Get initial supply (total ever minted via mintTo)
-                    # Burned = initial - current (regardless of burn method)
-                    
                     initial_supply = await self._get_initial_lp_supply(lp_mint, decimals)
                     
-                    # Also detect burn method for display purposes
-                    burn_tx_count = 0
+                    # Method 1: Incinerator balance
+                    incinerator_amount = 0.0
+                    incinerator_txs = 0
                     burn_account = None
-                    burn_method = None
                     
-                    # Check incinerator
                     burn_check = await self._rpc_request(
                         "getTokenAccountsByOwner",
                         [INCINERATOR, {"mint": lp_mint}, {"encoding": "jsonParsed"}]
@@ -618,35 +613,57 @@ class X1RPC:
                             info = tok.get("account", {}).get("data", {}).get("parsed", {}).get("info", {})
                             amt = float(info.get("tokenAmount", {}).get("uiAmount", 0) or 0)
                             if amt > 0:
+                                incinerator_amount += amt
                                 burn_account = tok.get("pubkey", "")
-                                burn_method = "incinerator"
                                 try:
                                     sigs = await self._rpc_request(
                                         "getSignaturesForAddress",
                                         [burn_account, {"limit": 20}]
                                     )
                                     if sigs:
-                                        burn_tx_count = len(sigs)
+                                        incinerator_txs = len(sigs)
                                 except:
-                                    burn_tx_count = 1
+                                    incinerator_txs = 1
 
-                    # Check BurnChecked
-                    if not burn_method:
-                        bc_burned, bc_tx_count = await self._check_burn_checked(lp_mint, decimals)
-                        if bc_burned > 0:
-                            burn_tx_count = bc_tx_count
-                            burn_method = "BurnChecked"
+                    # Method 2: BurnChecked (for tx count display)
+                    bc_burned, bc_tx_count = await self._check_burn_checked(lp_mint, decimals)
 
-                    # Calculate burned amount using supply difference
-                    if initial_supply > 0:
-                        burned_amount = max(0, initial_supply - supply_ui)
-                        burn_pct = (burned_amount / initial_supply * 100) if initial_supply > 0 else 0
-                        original_supply_for_pool = initial_supply
+                    # Determine burn method label
+                    if incinerator_amount > 0 and bc_burned > 0:
+                        burn_method = "Both"
+                    elif incinerator_amount > 0:
+                        burn_method = "incinerator"
+                    elif bc_burned > 0:
+                        burn_method = "BurnChecked"
                     else:
-                        # Fallback: no initial supply found
-                        burned_amount = 0
-                        burn_pct = 0
+                        burn_method = None
+                    
+                    burn_tx_count = incinerator_txs + bc_tx_count
+
+                    # Calculate burned amount:
+                    # Supply diff from initial = captures BurnChecked (reduces supply)
+                    # Incinerator = tokens locked (still in supply but inaccessible)
+                    supply_diff = max(0, initial_supply - supply_ui) if initial_supply > 0 else 0
+                    
+                    # If incinerator tokens exist, they're part of current supply
+                    # Real circulating = current - incinerator
+                    # So effective burn from initial = initial - (current - incinerator)
+                    if incinerator_amount > 0:
+                        effective_circulating = max(0, supply_ui - incinerator_amount)
+                        burned_amount = max(0, initial_supply - effective_circulating) if initial_supply > 0 else incinerator_amount
+                        # If current > initial (new LP minted after), still count incinerator as burned
+                        if burned_amount < incinerator_amount:
+                            burned_amount = incinerator_amount
+                    else:
+                        burned_amount = supply_diff
+
+                    # Denominator = initial supply (or current if initial not found)
+                    if initial_supply > 0:
+                        original_supply_for_pool = max(initial_supply, supply_ui)
+                    else:
                         original_supply_for_pool = supply_ui
+                    
+                    burn_pct = (burned_amount / original_supply_for_pool * 100) if original_supply_for_pool > 0 else 0
 
                     # Identify the pair token for this pool
                     pair_label = await self._identify_pool_pair(pool["address"], mint_address, raw_data, lp_mint)
@@ -799,6 +816,85 @@ class X1RPC:
 
         except Exception as e:
             print(f"Error getting initial LP supply: {e}")
+            return 0.0
+
+    async def _get_total_lp_minted(self, lp_mint: str, decimals: int) -> float:
+        """Get TOTAL LP ever minted (sum of ALL mintTo transactions).
+        This is the true denominator for burn % calculation."""
+        
+        # Check cache
+        from lp_cache import get_cached_initial_supply, set_cached_initial_supply
+        cache_key = f"total_{lp_mint}"
+        cached = get_cached_initial_supply(cache_key)
+        if cached is not None:
+            return cached
+
+        try:
+            all_sigs = []
+            before = None
+            for page in range(10):
+                params = [lp_mint, {"limit": 1000}]
+                if before:
+                    params[1]["before"] = before
+                sigs = await self._rpc_request("getSignaturesForAddress", params)
+                if not sigs:
+                    break
+                all_sigs.extend(sigs)
+                before = sigs[-1].get("signature")
+                if len(sigs) < 1000:
+                    break
+
+            if not all_sigs:
+                return 0.0
+
+            total_minted = 0.0
+
+            for sig_info in reversed(all_sigs):
+                sig = sig_info.get("signature")
+                if not sig:
+                    continue
+                try:
+                    tx = await self._rpc_request(
+                        "getTransaction",
+                        [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
+                    )
+                    if not tx:
+                        continue
+
+                    message = tx.get("transaction", {}).get("message", {})
+                    instructions = message.get("instructions", [])
+                    inner = tx.get("meta", {}).get("innerInstructions", [])
+                    all_ix = list(instructions)
+                    for ig in inner:
+                        all_ix.extend(ig.get("instructions", []))
+
+                    for ix in all_ix:
+                        parsed = ix.get("parsed", {})
+                        if not isinstance(parsed, dict):
+                            continue
+                        ix_type = parsed.get("type", "")
+                        info = parsed.get("info", {})
+
+                        if ix_type in ["mintTo", "mintToChecked"]:
+                            ix_mint = info.get("mint", "")
+                            if ix_mint and ix_mint == lp_mint:
+                                token_amount = info.get("tokenAmount", {})
+                                if token_amount and token_amount.get("uiAmount"):
+                                    amount = float(token_amount.get("uiAmount", 0) or 0)
+                                else:
+                                    raw = int(info.get("amount", 0))
+                                    amount = raw / (10 ** decimals) if raw > 0 else 0
+                                if amount > 0:
+                                    total_minted += amount
+                except:
+                    continue
+
+            if total_minted > 0:
+                set_cached_initial_supply(cache_key, total_minted)
+            return total_minted
+
+        except Exception as e:
+            print(f"Error getting total LP minted: {e}")
             return 0.0
 
     async def _check_burn_checked(self, lp_mint: str, decimals: int) -> tuple:
