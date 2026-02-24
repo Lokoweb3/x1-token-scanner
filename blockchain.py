@@ -640,28 +640,27 @@ class X1RPC:
                     
                     burn_tx_count = incinerator_txs + bc_tx_count
 
-                    # Calculate burned amount:
-                    # Supply diff from initial = captures BurnChecked (reduces supply)
-                    # Incinerator = tokens locked (still in supply but inaccessible)
-                    supply_diff = max(0, initial_supply - supply_ui) if initial_supply > 0 else 0
+                    # Calculate burned amount using adaptive formula:
+                    # Case 1: initial >= current → supply diff method (Loko_AI style)
+                    # Case 2: current > initial (LP grew) → use total removed / total minted
                     
-                    # If incinerator tokens exist, they're part of current supply
-                    # Real circulating = current - incinerator
-                    # So effective burn from initial = initial - (current - incinerator)
-                    if incinerator_amount > 0:
-                        effective_circulating = max(0, supply_ui - incinerator_amount)
-                        burned_amount = max(0, initial_supply - effective_circulating) if initial_supply > 0 else incinerator_amount
-                        # If current > initial (new LP minted after), still count incinerator as burned
-                        if burned_amount < incinerator_amount:
-                            burned_amount = incinerator_amount
+                    if initial_supply > 0 and initial_supply >= supply_ui:
+                        # Supply diff method: initial - current + incinerator
+                        supply_diff = initial_supply - supply_ui
+                        burned_amount = supply_diff + incinerator_amount
+                        original_supply_for_pool = initial_supply + incinerator_amount if incinerator_amount > 0 else initial_supply
+                    elif incinerator_amount > 0 or bc_burned > 0:
+                        # LP supply grew after burns — use total removed / total minted
+                        total_minted = await self._get_total_lp_minted(lp_mint, decimals)
+                        if total_minted > 0:
+                            burned_amount = incinerator_amount + bc_burned
+                            original_supply_for_pool = total_minted
+                        else:
+                            burned_amount = incinerator_amount + bc_burned
+                            original_supply_for_pool = supply_ui + bc_burned + incinerator_amount
                     else:
-                        burned_amount = supply_diff
-
-                    # Denominator = initial supply (or current if initial not found)
-                    if initial_supply > 0:
-                        original_supply_for_pool = max(initial_supply, supply_ui)
-                    else:
-                        original_supply_for_pool = supply_ui
+                        burned_amount = 0
+                        original_supply_for_pool = supply_ui if supply_ui > 0 else (initial_supply if initial_supply > 0 else 1)
                     
                     burn_pct = (burned_amount / original_supply_for_pool * 100) if original_supply_for_pool > 0 else 0
 
